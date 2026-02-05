@@ -10,6 +10,7 @@ import { FileSystemService } from "./src/filesystem.js";
 import { FrontmatterHandler } from "./src/frontmatter.js";
 import { PathFilter } from "./src/pathfilter.js";
 import { SearchService } from "./src/search.js";
+import { CanvasService } from "./src/canvas.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -64,6 +65,7 @@ const pathFilter = new PathFilter();
 const frontmatterHandler = new FrontmatterHandler();
 const fileSystem = new FileSystemService(vaultPath, pathFilter, frontmatterHandler);
 const searchService = new SearchService(vaultPath, pathFilter);
+const canvasService = new CanvasService(vaultPath, pathFilter);
 
 const server = new Server({
   name: "mcp-obsidian",
@@ -190,18 +192,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_notes",
-        description: "Search for notes in the vault by content or frontmatter",
+        description: "Search for notes in the vault by content or frontmatter. Supports multi-word search with AND/OR logic.",
         inputSchema: {
           type: "object",
           properties: {
             query: {
               type: "string",
-              description: "Search query text"
+              description: "Search query text. For multi-word queries, behavior depends on searchMode."
             },
             limit: {
               type: "number",
-              description: "Maximum number of results (default: 5, max: 20)",
-              default: 5
+              description: "Maximum number of results (default: 20, max: 100)",
+              default: 20
             },
             searchContent: {
               type: "boolean",
@@ -217,6 +219,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "boolean",
               description: "Case sensitive search (default: false)",
               default: false
+            },
+            searchMode: {
+              type: "string",
+              enum: ["exact", "all", "any"],
+              description: "Search mode: 'exact' matches the exact phrase, 'all' requires all words to be present (AND logic, default), 'any' matches if any word is present (OR logic)",
+              default: "all"
             },
             prettyPrint: {
               type: "boolean",
@@ -385,6 +393,253 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           }
         }
+      },
+      {
+        name: "find_notes",
+        description: "Find notes containing query words - returns only file paths (lightweight). Use this when you need a list of matching files without excerpts. Supports multi-word search with AND/OR logic.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search query text. For multi-word queries, behavior depends on searchMode."
+            },
+            limit: {
+              type: "number",
+              description: "Maximum number of results (default: 20, max: 100)",
+              default: 20
+            },
+            searchContent: {
+              type: "boolean",
+              description: "Search in note content (default: true)",
+              default: true
+            },
+            searchFrontmatter: {
+              type: "boolean",
+              description: "Search in frontmatter (default: false)",
+              default: false
+            },
+            caseSensitive: {
+              type: "boolean",
+              description: "Case sensitive search (default: false)",
+              default: false
+            },
+            searchMode: {
+              type: "string",
+              enum: ["exact", "all", "any"],
+              description: "Search mode: 'exact' matches the exact phrase, 'all' requires all words to be present (AND logic, default), 'any' matches if any word is present (OR logic)",
+              default: "all"
+            }
+          },
+          required: ["query"]
+        }
+      },
+      // Canvas tools
+      {
+        name: "create_canvas",
+        description: "Create a new Obsidian canvas file. Canvas files are visual diagrams with nodes (text, files, links, groups) and edges (connections).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path for the canvas file (relative to vault root). .canvas extension added automatically if missing."
+            },
+            nodes: {
+              type: "array",
+              description: "Initial nodes to create (optional)",
+              items: {
+                type: "object",
+                properties: {
+                  type: { type: "string", enum: ["text", "file", "link", "group"] },
+                  x: { type: "number" },
+                  y: { type: "number" },
+                  width: { type: "number" },
+                  height: { type: "number" },
+                  text: { type: "string", description: "For text nodes" },
+                  file: { type: "string", description: "For file nodes - path to note" },
+                  url: { type: "string", description: "For link nodes" },
+                  label: { type: "string", description: "For group nodes" },
+                  color: { type: "string", description: "Color: hex (#RRGGBB) or preset (1-6)" }
+                },
+                required: ["type", "x", "y"]
+              }
+            },
+            edges: {
+              type: "array",
+              description: "Initial edges to create (optional)",
+              items: {
+                type: "object",
+                properties: {
+                  fromNode: { type: "string", description: "Source node ID" },
+                  toNode: { type: "string", description: "Target node ID" },
+                  fromSide: { type: "string", enum: ["top", "right", "bottom", "left"] },
+                  toSide: { type: "string", enum: ["top", "right", "bottom", "left"] },
+                  toEnd: { type: "string", enum: ["none", "arrow"] },
+                  label: { type: "string" }
+                },
+                required: ["fromNode", "toNode"]
+              }
+            }
+          },
+          required: ["path"]
+        }
+      },
+      {
+        name: "read_canvas",
+        description: "Read an Obsidian canvas file and return its structure (nodes and edges).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the canvas file (relative to vault root)"
+            },
+            prettyPrint: {
+              type: "boolean",
+              description: "Format JSON response with indentation (default: false)",
+              default: false
+            }
+          },
+          required: ["path"]
+        }
+      },
+      {
+        name: "add_canvas_node",
+        description: "Add a node to an existing canvas. Node types: text (markdown content), file (embed a note), link (web URL), group (visual container).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the canvas file"
+            },
+            type: {
+              type: "string",
+              enum: ["text", "file", "link", "group"],
+              description: "Type of node to add"
+            },
+            x: { type: "number", description: "X position in pixels" },
+            y: { type: "number", description: "Y position in pixels" },
+            width: { type: "number", description: "Width in pixels (default: 400)" },
+            height: { type: "number", description: "Height in pixels (default: 200)" },
+            text: { type: "string", description: "Content for text nodes (markdown supported)" },
+            file: { type: "string", description: "Path to note for file nodes" },
+            subpath: { type: "string", description: "Heading/block reference for file nodes (e.g., #heading)" },
+            url: { type: "string", description: "URL for link nodes" },
+            label: { type: "string", description: "Label for group nodes" },
+            color: { type: "string", description: "Color: hex (#RRGGBB) or preset number (1=red, 2=orange, 3=yellow, 4=green, 5=cyan, 6=purple)" }
+          },
+          required: ["path", "type", "x", "y"]
+        }
+      },
+      {
+        name: "update_canvas_node",
+        description: "Update properties of an existing canvas node.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the canvas file"
+            },
+            nodeId: {
+              type: "string",
+              description: "ID of the node to update"
+            },
+            updates: {
+              type: "object",
+              description: "Properties to update (x, y, width, height, text, color, etc.)"
+            }
+          },
+          required: ["path", "nodeId", "updates"]
+        }
+      },
+      {
+        name: "remove_canvas_node",
+        description: "Remove a node from the canvas. Also removes all edges connected to this node.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the canvas file"
+            },
+            nodeId: {
+              type: "string",
+              description: "ID of the node to remove"
+            }
+          },
+          required: ["path", "nodeId"]
+        }
+      },
+      {
+        name: "add_canvas_edge",
+        description: "Add an edge (connection) between two nodes in a canvas.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the canvas file"
+            },
+            fromNode: {
+              type: "string",
+              description: "ID of the source node"
+            },
+            toNode: {
+              type: "string",
+              description: "ID of the target node"
+            },
+            fromSide: {
+              type: "string",
+              enum: ["top", "right", "bottom", "left"],
+              description: "Side of source node where edge starts"
+            },
+            toSide: {
+              type: "string",
+              enum: ["top", "right", "bottom", "left"],
+              description: "Side of target node where edge ends"
+            },
+            fromEnd: {
+              type: "string",
+              enum: ["none", "arrow"],
+              description: "Shape at start of edge (default: none)"
+            },
+            toEnd: {
+              type: "string",
+              enum: ["none", "arrow"],
+              description: "Shape at end of edge (default: none)"
+            },
+            color: {
+              type: "string",
+              description: "Edge color: hex or preset (1-6)"
+            },
+            label: {
+              type: "string",
+              description: "Text label for the edge"
+            }
+          },
+          required: ["path", "fromNode", "toNode"]
+        }
+      },
+      {
+        name: "remove_canvas_edge",
+        description: "Remove an edge (connection) from a canvas.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the canvas file"
+            },
+            edgeId: {
+              type: "string",
+              description: "ID of the edge to remove"
+            }
+          },
+          required: ["path", "edgeId"]
+        }
       }
     ]
   };
@@ -513,7 +768,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           limit: trimmedArgs.limit,
           searchContent: trimmedArgs.searchContent,
           searchFrontmatter: trimmedArgs.searchFrontmatter,
-          caseSensitive: trimmedArgs.caseSensitive
+          caseSensitive: trimmedArgs.caseSensitive,
+          searchMode: trimmedArgs.searchMode
         });
         const indent = trimmedArgs.prettyPrint ? 2 : undefined;
         return {
@@ -638,6 +894,154 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               }, null, indent)
             }
           ]
+        };
+      }
+
+      case "find_notes": {
+        const result = await searchService.findNotes({
+          query: trimmedArgs.query,
+          limit: trimmedArgs.limit,
+          searchContent: trimmedArgs.searchContent,
+          searchFrontmatter: trimmedArgs.searchFrontmatter,
+          caseSensitive: trimmedArgs.caseSensitive,
+          searchMode: trimmedArgs.searchMode
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result)
+            }
+          ]
+        };
+      }
+
+      // Canvas tool handlers
+      case "create_canvas": {
+        const result = await canvasService.createCanvas({
+          path: trimmedArgs.path,
+          nodes: trimmedArgs.nodes,
+          edges: trimmedArgs.edges
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ],
+          isError: !result.success
+        };
+      }
+
+      case "read_canvas": {
+        const canvas = await canvasService.readCanvas(trimmedArgs.path);
+        const indent = trimmedArgs.prettyPrint ? 2 : undefined;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(canvas, null, indent)
+            }
+          ]
+        };
+      }
+
+      case "add_canvas_node": {
+        const result = await canvasService.addNode({
+          path: trimmedArgs.path,
+          type: trimmedArgs.type,
+          x: trimmedArgs.x,
+          y: trimmedArgs.y,
+          width: trimmedArgs.width,
+          height: trimmedArgs.height,
+          text: trimmedArgs.text,
+          file: trimmedArgs.file,
+          subpath: trimmedArgs.subpath,
+          url: trimmedArgs.url,
+          label: trimmedArgs.label,
+          color: trimmedArgs.color
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ],
+          isError: !result.success
+        };
+      }
+
+      case "update_canvas_node": {
+        const result = await canvasService.updateNode({
+          path: trimmedArgs.path,
+          nodeId: trimmedArgs.nodeId,
+          updates: trimmedArgs.updates
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ],
+          isError: !result.success
+        };
+      }
+
+      case "remove_canvas_node": {
+        const result = await canvasService.removeNode({
+          path: trimmedArgs.path,
+          nodeId: trimmedArgs.nodeId
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ],
+          isError: !result.success
+        };
+      }
+
+      case "add_canvas_edge": {
+        const result = await canvasService.addEdge({
+          path: trimmedArgs.path,
+          fromNode: trimmedArgs.fromNode,
+          toNode: trimmedArgs.toNode,
+          fromSide: trimmedArgs.fromSide,
+          toSide: trimmedArgs.toSide,
+          fromEnd: trimmedArgs.fromEnd,
+          toEnd: trimmedArgs.toEnd,
+          color: trimmedArgs.color,
+          label: trimmedArgs.label
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ],
+          isError: !result.success
+        };
+      }
+
+      case "remove_canvas_edge": {
+        const result = await canvasService.removeEdge({
+          path: trimmedArgs.path,
+          edgeId: trimmedArgs.edgeId
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ],
+          isError: !result.success
         };
       }
 
